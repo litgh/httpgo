@@ -55,7 +55,8 @@ func (t *Tokenizer) Next() Token {
 			return Token{Type: Flag, Key: t.Token(), Val: t.scanNext(' ')}
 		case ':':
 			s := t.tokBuf.String()
-			if s == "http" || s == "https" || s == "" {
+			if s == "http" || s == "https" || s == "" || strings.Contains(s, ".") {
+				t.tokBuf.WriteRune(ch)
 				return Token{Type: String, Val: t.scanNext(' ')}
 			}
 			return Token{Type: Header, Key: t.Token(), Val: t.scanNext(' ')}

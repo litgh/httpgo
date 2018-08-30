@@ -1,12 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"net/http/httputil"
@@ -17,10 +17,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/c-bata/go-prompt"
 	"github.com/fatih/color"
 	"github.com/json-iterator/go"
+	"github.com/tidwall/gjson"
 )
 
 // Http methods
@@ -42,20 +44,22 @@ var (
 	req     = newReq()
 	scheme  = "http"
 	suggest = newSuggestion()
-	call    = false
 
-	regHeader = regexp.MustCompile(`(\w+\s*:)(.+)`)
+	regHeader = regexp.MustCompile(`([a-zA-Z0-9-_]+:\s)(.+)`)
+	regStatus = regexp.MustCompile(`(HTTP/1\.1) (([2345])\d{2})`)
 )
 
 // Request is the http request
 type Request struct {
 	Method          string
-	URL             string
+	URL             *url.URL
 	Username        string
 	Password        string
+	Proxy           string
 	JSON            bool
 	Form            bool
 	Bench           bool
+	Call            bool
 	NumberOfRequest uint64
 	Concurrency     uint64
 	Duration        time.Duration
@@ -66,6 +70,7 @@ type Request struct {
 	Files           url.Values
 	JSONMap         map[string][]interface{}
 	Body            []byte
+	ResponseBody    []byte
 }
 
 func executor(in string) {
@@ -74,60 +79,134 @@ func executor(in string) {
 	case "h", "help", "?":
 		usage()
 	case "p":
-		httpReq, _ := req.newHTTPRequest()
+		httpReq, err := req.newHTTPRequest()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 		dump, _ := httputil.DumpRequestOut(httpReq, true)
-		dump = regHeader.ReplaceAllFunc(dump, func(src []byte) []byte {
-			var buf bytes.Buffer
-			c := color.New(color.FgCyan)
-			sub := regHeader.FindAllSubmatch(src, -1)
-			buf.Write(sub[0][1])
-			c.Fprint(&buf, string(sub[0][2]))
-			return buf.Bytes()
-		})
-		fmt.Println(string(dump))
+		fmt.Println(colorize(dump))
+		fmt.Println("")
 	default:
 		var tokenizer Tokenizer
 		tokenizer.Init(in)
+		var tok Token
 	loop:
 		for {
-			tok := tokenizer.Next()
+			tok = tokenizer.Next()
 			switch tok.Type {
 			case String:
-				if inSlice(HTTPMethods, tok.Val) {
-					req.Method = tok.Val
-				} else {
-					req.URL = tok.Val
-					if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
-						req.URL = scheme + "://" + req.URL
-					} else if strings.HasPrefix(req.URL, ":") {
-						req.URL = scheme + "://localhost" + req.URL
+				// 脚本
+				if strings.HasPrefix(tok.Val, "!") {
+					content := readFile(tok.Val[1:])
+					if len(content) == 0 {
+						continue loop
 					}
+					fmt.Printf("> Load file `%s`\n", tok.Val[1:])
+					rd := bufio.NewReader(bytes.NewReader(content))
+					var command []string
+					for {
+						l, err := rd.ReadString('\n')
+						if err == io.EOF {
+							break
+						}
+						l = strings.TrimSpace(l)
+						if l != "" {
+							fmt.Println(">", l)
+							command = append(command, l)
+						}
+					}
+					if len(command) > 0 {
+						tokenizer.Init(strings.Join(command, " "))
+						goto loop
+					}
+				} else if inSlice(HTTPMethods, tok.Val) {
+					req.Method = strings.ToUpper(tok.Val)
+				} else if strings.HasPrefix(tok.Val, "[") && strings.HasSuffix(tok.Val, "]") {
+					if len(req.ResponseBody) == 0 {
+						continue loop
+					}
+					jsonPath := tok.Val[1 : len(tok.Val)-1]
+					v := gjson.GetBytes(req.ResponseBody, jsonPath)
+					b, _ := json.MarshalIndent(v.Value(), "", " ")
+					fmt.Println("json:", jsonPath, string(b))
+					suggest.AddSuggest(tok.Val)
+				} else {
+					var URL = tok.Val
+					var err error
+					if req.URL != nil && strings.HasPrefix(URL, "/") {
+						req.URL, err = req.URL.Parse(URL)
+						if err != nil {
+							req.errorf("parse `%s` %v\n", URL, err)
+							return
+						}
+					} else if strings.HasPrefix(URL, ":") || strings.HasPrefix(URL, "/") {
+						req.URL, err = url.Parse(scheme + "://localhost" + URL)
+					} else if !strings.HasPrefix(URL, "http://") && !strings.HasPrefix(URL, "https://") {
+						req.URL, err = url.Parse(scheme + "://" + URL)
+					} else {
+						req.URL, err = url.Parse(URL)
+						scheme = req.URL.Scheme
+					}
+
+					if err != nil {
+						req.error(err)
+						return
+					}
+
 					if req.Method == "" {
 						req.Method = GET
 					}
+					suggest.AddSuggest(req.URL.String())
 				}
 			case Header:
 				req.Header.Set(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest(tok.Key + ":" + tok.Val)
 			case Field:
-				req.Fields.Add(tok.Key, tok.Val)
+				req.Fields.Set(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest(tok.Key + "=" + tok.Val)
 			case Param:
-				req.Values.Add(tok.Key, tok.Val)
+				req.Values.Set(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest(tok.Key + "==" + tok.Val)
 			case RawJSON:
 				rawJSON(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest(tok.Key + "=:" + tok.Val)
+
+				if req.Method == GET {
+					req.Method = POST
+				}
 			case Flag:
 				flag(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest(tok.Key + "=" + tok.Val)
+			case File:
+				if tok.Key == "" {
+					req.Body = readFile(tok.Val)
+					suggest.AddSuggest("@" + tok.Val)
+				} else {
+					req.Files.Add(tok.Key, tok.Val)
+					suggest.AddSuggest(tok.Key)
+					suggest.AddSuggest("@" + tok.Val)
+				}
+
+				if req.Method == GET {
+					req.Method = POST
+				}
 			case EOF:
 				break loop
 			}
 		}
 
 		LivePrefixState.IsEnable = true
-		if req.URL != "" {
-			LivePrefixState.LivePrefix = req.Method + " " + req.URL + " > "
-		} else {
+		if req.URL != nil {
+			LivePrefixState.LivePrefix = req.Method + " " + req.URL.String() + " > "
+		} else if req.Method != "" {
 			LivePrefixState.LivePrefix = req.Method + " > "
 		}
-		// }
 	}
 
 }
@@ -153,13 +232,17 @@ func main() {
 	p := prompt.New(
 		executor,
 		func(in prompt.Document) []prompt.Suggest {
+			if in.GetWordBeforeCursor() == "" {
+				return []prompt.Suggest{}
+			}
 			return prompt.FilterContains(suggest.Suggest(req), in.GetWordBeforeCursor(), true)
 		},
 		prompt.OptionLivePrefix(changeLivePrefix),
-		prompt.OptionTitle("GO-http-prompt"),
-		prompt.OptionAddKeyBind(bindReset(), bindDoRequest()),
+		prompt.OptionTitle("Httpgo"),
+		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindQuit()),
+		prompt.OptionPrefixTextColor(prompt.Blue),
 	)
-	fmt.Println("Welcome to the Go-http-Prompt!\nEnter 'h, help, ?' for help, Ctrl+D exit")
+	fmt.Println("Welcome to the Httpgo!\nEnter 'h, help, ?' for help, Ctrl+D exit")
 	usage()
 	p.Run()
 }
@@ -173,10 +256,18 @@ func inSlice(slice []string, value string) bool {
 	return false
 }
 
+func bindQuit() prompt.KeyBind {
+	return prompt.KeyBind{Key: prompt.ControlB, Fn: func(buf *prompt.Buffer) {
+		suggest.Save()
+	}}
+}
+
 func bindReset() prompt.KeyBind {
 	return prompt.KeyBind{Key: prompt.ControlC, Fn: func(buf *prompt.Buffer) {
 		LivePrefixState.IsEnable = false
-		req = newReq()
+		r := newReq()
+		r.Proxy = req.Proxy
+		req = r
 	}}
 }
 
@@ -234,14 +325,27 @@ func bindDoRequest() prompt.KeyBind {
 }
 
 func httpCall() {
-	client := http.Client{Timeout: time.Second * 10}
+	if int64(req.Timeout) == 0 {
+		req.Timeout = time.Second * 30
+	}
+	client := http.Client{Timeout: req.Timeout}
+	if req.Proxy != "" {
+		proxyURL, err := url.Parse(req.Proxy)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+		client.Transport = transport
+	}
+
 	r, err := req.newHTTPRequest()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	out, _ := httputil.DumpRequest(r, true)
-	fmt.Printf("%s\n", out)
+	fmt.Printf("\n%s\n", colorize(out))
 	resp, err := client.Do(r)
 	if err != nil {
 		fmt.Println(err)
@@ -249,9 +353,8 @@ func httpCall() {
 	}
 	defer resp.Body.Close()
 	out, _ = httputil.DumpResponse(resp, true)
-	fmt.Printf("%s\n", out)
-
-	call = false
+	fmt.Printf("\n%s\n", colorize(out))
+	req.ResponseBody, _ = ioutil.ReadAll(resp.Body)
 }
 
 func newReq() *Request {
@@ -260,36 +363,38 @@ func newReq() *Request {
 
 func rawJSON(key, value string) {
 	var j interface{}
+	var err error
 	if strings.HasPrefix(value, "@") {
-		filename := value[1:]
-		f, err := os.Open(filename)
-		if err != nil {
-			fmt.Println("Read file", filename, err)
-			call = false
-			return
-		}
-		content, err := ioutil.ReadAll(f)
-		if err != nil {
-			fmt.Println("ReadAll from file", filename, err)
-			call = false
-			return
-		}
+		content := readFile(value[1:])
 		err = json.Unmarshal(content, &j)
 		if err != nil {
-			fmt.Println("Read from file", filename, "unmarshal", err)
-			call = false
+			req.error("Read from file", value[1:], "unmarshal", err)
 			return
 		}
 	} else {
-		err := json.UnmarshalFromString(value, &j)
+		err = json.UnmarshalFromString(value, &j)
 		if err != nil {
-			fmt.Println("Unmarshal", "`"+value+"`", err)
-			call = false
+			req.error("Unmarshal", "`"+value+"`", err)
 			return
 		}
 	}
 	req.Method = POST
 	req.JSONMap[key] = append(req.JSONMap[key], j)
+}
+
+func readFile(filename string) []byte {
+	f, err := os.Open(filename)
+	if err != nil {
+		req.error("Read file", filename, err)
+		return nil
+	}
+	defer f.Close()
+	content, err := ioutil.ReadAll(f)
+	if err != nil {
+		req.error("ReadAll from file", filename, err)
+		return nil
+	}
+	return content
 }
 
 func flag(key, value string) {
@@ -298,7 +403,7 @@ func flag(key, value string) {
 		pair := strings.Split(value, ":")
 		if len(pair) > 1 {
 			req.Username = pair[0]
-			req.Password = pair[1]
+			req.Password = strings.Join(pair[1:], "")
 		}
 	case "$json":
 		req.JSON = true
@@ -308,56 +413,68 @@ func flag(key, value string) {
 		req.Form = true
 	case "$scheme":
 		scheme = value
+	case "$proxy":
+		req.Proxy = value
 	case "$timeout":
 		d, err := time.ParseDuration(value)
 		if err == nil {
 			req.Timeout = d
 		} else {
-			fmt.Printf("$timeout=%s %v/n", value, err)
-			call = false
+			req.errorf("$timeout=%s %v/n", value, err)
 		}
-	case "$n":
-		n, err := strconv.ParseUint(value, 10, 64)
-		if err == nil {
-			req.Bench = true
-			req.NumberOfRequest = n
-		} else {
-			fmt.Printf("$n=%s %v/n", value, err)
-			call = false
+	case "$bench":
+		pair := strings.Split(value, ",")
+		if len(pair) != 2 {
+			req.errorf("$bench={concurrency},{total_request or duration}, eg: $bench=10,10s $bench=10,1000")
+			return
 		}
-	case "$d":
-		d, err := time.ParseDuration(value)
-		if err == nil {
-			req.Bench = true
-			req.Duration = d
-		} else {
-			fmt.Printf("$d=%s %v/n", value, err)
-			call = false
-		}
-	case "$c":
-		c, err := strconv.ParseUint(value, 10, 64)
+		c, err := strconv.ParseUint(pair[0], 10, 64)
 		if err == nil {
 			req.Bench = true
 			req.Concurrency = c
 		} else {
-			fmt.Printf("$n=%s %v/n", value, err)
-			call = false
+			req.errorf("$bench=%s %v\n", value, err)
+			return
 		}
+		if pair[1] != "" && !unicode.IsDigit(rune(pair[1][len(pair[1])-1])) {
+			d, err := time.ParseDuration(pair[1])
+			if err == nil {
+				req.Bench = true
+				req.Duration = d
+			} else {
+				req.errorf("$bench=%s %v\n", value, err)
+			}
+		} else if pair[1] != "" {
+			n, err := strconv.ParseUint(pair[0], 10, 64)
+			if err == nil {
+				req.Bench = true
+				req.NumberOfRequest = n
+			} else {
+				req.errorf("$bench=%s %v\n", value, err)
+			}
+		}
+
 	default:
-		fmt.Println("unknown", key)
-		call = false
+		req.error("unknown", key)
 	}
 }
 
 func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
-	if len(r.Values) != 0 {
-		r.URL += "?" + r.Values.Encode()
+	if r.URL == nil {
+		return nil, fmt.Errorf("URL not set")
 	}
+	var _URL = r.URL.String()
+	if len(r.Values) != 0 {
+		_URL += "?" + r.Values.Encode()
+	}
+	r.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	r.Header.Set("Accept", "application/json")
+
 	if r.Method == POST || r.Method == PUT || r.Method == PATCH {
 		var body io.Reader
-		if len(r.Body) > 0 {
-			body = bytes.NewReader(r.Body)
-		} else if len(r.JSONMap) > 0 {
+		if req.Body != nil && len(req.Body) > 0 {
+			body = bytes.NewReader(req.Body)
+		} else if len(r.JSONMap) > 0 && r.JSON {
 			body = r.jsonBody()
 		} else if len(r.Files) > 0 {
 			pipeReader, pipeWriter := io.Pipe()
@@ -367,21 +484,23 @@ func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
 					for _, file := range filename {
 						fileWriter, err := bodyWriter.CreateFormFile(param, file)
 						if err != nil {
-							log.Fatal(err)
+							req.error(err)
 						}
 						f, err := os.Open(file)
 						if err != nil {
-							log.Fatal(err)
+							req.error(err)
 						}
 						_, err = io.Copy(fileWriter, f)
 						f.Close()
 						if err != nil {
-							log.Fatal(err)
+							req.error(err)
 						}
 					}
 				}
 				for k, v := range r.Fields {
-					bodyWriter.WriteField(k, strings.Join(v, ","))
+					for _, l := range v {
+						bodyWriter.WriteField(k, l)
+					}
 				}
 				bodyWriter.Close()
 				pipeWriter.Close()
@@ -393,16 +512,17 @@ func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
 				body = r.jsonBody()
 			} else {
 				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				body = strings.NewReader(r.Values.Encode())
+				body = strings.NewReader(r.Fields.Encode())
 			}
 		}
-		httpReq, err = http.NewRequest(r.Method, r.URL, body)
+		httpReq, err = http.NewRequest(r.Method, _URL, body)
 		if err != nil {
+			fmt.Println(err)
 			return
 		}
 	}
 	if r.Method == GET || r.Method == DELETE || r.Method == OPTIONS {
-		httpReq, _ = http.NewRequest(r.Method, r.URL, nil)
+		httpReq, _ = http.NewRequest(r.Method, _URL, nil)
 	}
 	if r.Username != "" {
 		httpReq.SetBasicAuth(r.Username, r.Password)
@@ -412,8 +532,6 @@ func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
 }
 
 func (r *Request) jsonBody() io.Reader {
-	r.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	r.Header.Set("Accept", "application/json")
 	js := make(map[string]interface{})
 
 	if len(r.Fields) > 0 {
@@ -422,7 +540,6 @@ func (r *Request) jsonBody() io.Reader {
 				r.JSONMap[k] = append(r.JSONMap[k], x)
 			}
 		}
-		r.Fields = make(url.Values)
 	}
 
 	for k, v := range r.JSONMap {
@@ -433,5 +550,49 @@ func (r *Request) jsonBody() io.Reader {
 		}
 	}
 	b, _ := json.Marshal(js)
+	r.JSONMap = make(map[string][]interface{})
 	return bytes.NewReader(b)
+}
+
+func (r *Request) errorf(format string, a ...interface{}) {
+	r.Call = false
+	fmt.Printf(format, a...)
+}
+
+func (r *Request) error(err ...interface{}) {
+	r.Call = false
+	fmt.Println(err...)
+}
+
+func colorize(dump []byte) string {
+	b := regHeader.ReplaceAllFunc(dump, func(src []byte) []byte {
+		var buf bytes.Buffer
+		k := color.New(color.FgGreen)
+		v := color.New(color.FgCyan)
+		sub := regHeader.FindAllSubmatch(src, -1)
+		k.Fprint(&buf, string(sub[0][1]))
+		v.Fprint(&buf, string(sub[0][2]))
+		return buf.Bytes()
+	})
+	b = regStatus.ReplaceAllFunc(b, func(src []byte) []byte {
+		var buf bytes.Buffer
+		m := regStatus.FindAllSubmatch(src, -1)
+		s := string(m[0][3])
+		buf.Write(m[0][1])
+		buf.WriteString(" ")
+		var c *color.Color
+		switch s {
+		case "2":
+			c = color.New(color.FgGreen)
+		case "3":
+			c = color.New(color.FgYellow)
+		case "4":
+			c = color.New(color.FgBlue)
+		case "5":
+			c = color.New(color.FgHiRed)
+		}
+		c.Fprint(&buf, string(m[0][2]))
+		return buf.Bytes()
+	})
+	return string(b)
 }
