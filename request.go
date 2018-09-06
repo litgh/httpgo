@@ -54,12 +54,22 @@ type Request struct {
 	Fields          url.Values
 	Files           url.Values
 	JSONMap         map[string][]interface{}
-	Body            []byte
+	Body            bytes.Buffer
 	ResponseBody    []byte
 }
 
 func newReq() *Request {
 	return &Request{Header: make(http.Header), Values: make(url.Values), Files: make(url.Values), Fields: make(url.Values), JSON: true, JSONMap: make(map[string][]interface{})}
+}
+
+func (r *Request) reset() {
+	r.Body.Reset()
+	r.ResponseBody = nil
+	r.Fields = make(url.Values)
+	r.Files = make(url.Values)
+	r.Values = make(url.Values)
+	r.JSONMap = make(map[string][]interface{})
+
 }
 
 func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
@@ -75,8 +85,8 @@ func (r *Request) newHTTPRequest() (httpReq *http.Request, err error) {
 
 	if r.Method == POST || r.Method == PUT || r.Method == PATCH {
 		var body io.Reader
-		if req.Body != nil && len(req.Body) > 0 {
-			body = bytes.NewReader(req.Body)
+		if req.Body.Len() > 0 {
+			body = bytes.NewReader(req.Body.Bytes())
 		} else if len(r.JSONMap) > 0 && r.JSON {
 			body = r.jsonBody()
 		} else if len(r.Files) > 0 {

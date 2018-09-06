@@ -18,16 +18,31 @@ import (
 	"unicode"
 
 	"github.com/c-bata/go-prompt"
-	jsoniter "github.com/json-iterator/go"
+	"github.com/json-iterator/go"
+	"github.com/manifoldco/promptui"
 	"github.com/tidwall/gjson"
 )
 
-var (
-	json    = jsoniter.ConfigCompatibleWithStandardLibrary
-	req     = newReq()
-	scheme  = "http"
-	suggest = newSuggestion()
+const (
+	HELP    = "?"
+	PRINT   = "p"
+	HISTORY = "!!"
 )
+
+var (
+	json      = jsoniter.ConfigCompatibleWithStandardLibrary
+	req       = newReq()
+	scheme    = "http"
+	suggest   = newSuggestion()
+	histories *History
+)
+
+type History struct {
+	idx  int
+	prev *History
+	next *History
+	req  Request
+}
 
 var LivePrefixState struct {
 	LivePrefix string
@@ -50,7 +65,7 @@ func main() {
 		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindQuit()),
 		prompt.OptionPrefixTextColor(prompt.Blue),
 	)
-	fmt.Println("Welcome to the Httpgo!\nEnter 'h, help, ?' for help, Ctrl+D exit")
+	fmt.Println("Welcome to the Httpgo!\nEnter '?' for help, Ctrl+D exit")
 	usage()
 	p.Run()
 }
@@ -58,10 +73,40 @@ func main() {
 func executor(in string) {
 	in = strings.TrimSpace(in)
 	switch in {
-	case "h", "help", "?":
+	case HELP:
 		usage()
-	case "p":
+	case PRINT:
 		dump()
+	case HISTORY:
+		if histories == nil {
+			fmt.Println("No History!")
+			return
+		}
+		sel := promptui.Select{}
+		sel.Label = "History: "
+		items := []string{fmt.Sprintf("%s %s", histories.req.Method, histories.req.URL.String())}
+
+		for h := histories.next; h != nil; h = h.next {
+			items = append(items, fmt.Sprintf("%s %s", h.req.Method, h.req.URL.String()))
+		}
+
+		sel.Items = items
+		idx, _, err := sel.Run()
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		i := 0
+		fmt.Println(i, idx)
+		for h := histories.next; h != nil; h = h.next {
+			if i == idx {
+				req = &(h.req)
+				break
+			}
+			i++
+		}
+		changePrefix()
 	default:
 		var tokenizer Tokenizer
 		tokenizer.Init(in)
@@ -95,8 +140,10 @@ func executor(in string) {
 						tokenizer.Init(strings.Join(command, " "))
 						goto loop
 					}
+					// http method
 				} else if inSlice(HTTPMethods, tok.Val) {
 					req.Method = strings.ToUpper(tok.Val)
+					// json path
 				} else if strings.HasPrefix(tok.Val, "[") && strings.HasSuffix(tok.Val, "]") {
 					if len(req.ResponseBody) == 0 {
 						continue loop
@@ -107,21 +154,23 @@ func executor(in string) {
 					fmt.Println("json:", jsonPath, string(b))
 					suggest.AddSuggest(tok.Val)
 				} else {
-					var URL = tok.Val
+					var _url *url.URL
 					var err error
-					if req.URL != nil && strings.HasPrefix(URL, "/") {
-						req.URL, err = req.URL.Parse(URL)
+					if req.URL != nil && strings.HasPrefix(tok.Val, "/") {
+						_url, err = req.URL.Parse(tok.Val)
 						if err != nil {
-							req.errorf("parse `%s` %v\n", URL, err)
+							req.errorf("parse `%s` %v\n", tok.Val, err)
 							return
 						}
-					} else if strings.HasPrefix(URL, ":") || strings.HasPrefix(URL, "/") {
-						req.URL, err = url.Parse(scheme + "://localhost" + URL)
-					} else if !strings.HasPrefix(URL, "http://") && !strings.HasPrefix(URL, "https://") {
-						req.URL, err = url.Parse(scheme + "://" + URL)
+					} else if strings.HasPrefix(tok.Val, ":") || strings.HasPrefix(tok.Val, "/") {
+						_url, err = url.Parse(scheme + "://localhost" + tok.Val)
+					} else if !strings.HasPrefix(tok.Val, "http://") && !strings.HasPrefix(tok.Val, "https://") {
+						_url, err = url.Parse(scheme + "://" + tok.Val)
 					} else {
-						req.URL, err = url.Parse(URL)
-						scheme = req.URL.Scheme
+						_url, err = url.Parse(tok.Val)
+						if err == nil {
+							scheme = _url.Scheme
+						}
 					}
 
 					if err != nil {
@@ -132,7 +181,12 @@ func executor(in string) {
 					if req.Method == "" {
 						req.Method = GET
 					}
-					suggest.AddSuggest(req.URL.String())
+
+					suggest.AddSuggest(_url.String())
+					if req.URL != nil && _url.String() != req.URL.String() {
+						req.reset()
+					}
+					req.URL = _url
 				}
 			case Header:
 				req.Header.Set(tok.Key, tok.Val)
@@ -160,7 +214,8 @@ func executor(in string) {
 				suggest.AddSuggest(tok.Key + "=" + tok.Val)
 			case File:
 				if tok.Key == "" {
-					req.Body = readFile(tok.Val)
+					req.Body.Reset()
+					req.Body.Write(readFile(tok.Val))
 					suggest.AddSuggest("@" + tok.Val)
 				} else {
 					req.Files.Add(tok.Key, tok.Val)
@@ -176,14 +231,18 @@ func executor(in string) {
 			}
 		}
 
-		LivePrefixState.IsEnable = true
-		if req.URL != nil {
-			LivePrefixState.LivePrefix = req.Method + " " + req.URL.String() + " > "
-		} else if req.Method != "" {
-			LivePrefixState.LivePrefix = req.Method + " > "
-		}
+		changePrefix()
 	}
 
+}
+
+func changePrefix() {
+	LivePrefixState.IsEnable = true
+	if req.URL != nil {
+		LivePrefixState.LivePrefix = req.Method + " " + req.URL.String() + " > "
+	} else if req.Method != "" {
+		LivePrefixState.LivePrefix = req.Method + " > "
+	}
 }
 
 func usage() {
@@ -261,7 +320,6 @@ func bindDoRequest() prompt.KeyBind {
 						c <- struct{}{}
 						wg.Add(1)
 						go do()
-
 					}
 				}
 			} else {
@@ -313,6 +371,30 @@ func httpCall() {
 	out, _ = httputil.DumpResponse(resp, true)
 	fmt.Printf("\n%s\n", colorize(out))
 	req.ResponseBody, _ = ioutil.ReadAll(resp.Body)
+
+	hist := *req
+	if histories == nil {
+		histories = &History{req: hist}
+		return
+	}
+
+	t := histories.next
+	if t == nil {
+		if histories.req.Method == hist.Method && histories.req.URL.String() == hist.URL.String() {
+			histories.req = hist
+			return
+		}
+	} else {
+		for ; t != nil; t = t.next {
+			if t.req.Method == hist.Method && t.req.URL.String() == hist.URL.String() {
+				t.next, histories.prev, histories = histories, t, t
+				return
+			}
+		}
+	}
+	t = &History{req: hist}
+	t.next, histories.prev, histories = histories, t, t
+
 }
 
 func rawJSON(key, value string) {
