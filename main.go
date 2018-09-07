@@ -44,6 +44,10 @@ type History struct {
 	req  Request
 }
 
+func (h *History) String() string {
+	return fmt.Sprintf("%s %s", h.req.Method, h.req.URL.String())
+}
+
 var LivePrefixState struct {
 	LivePrefix string
 	IsEnable   bool
@@ -51,7 +55,18 @@ var LivePrefixState struct {
 
 func main() {
 	p := prompt.New(
-		executor,
+		func(in string) {
+			in = strings.TrimSpace(in)
+			switch in {
+			case HELP:
+				usage()
+			case PRINT:
+				dump()
+			default:
+				parse(in)
+			}
+
+		},
 		func(in prompt.Document) []prompt.Suggest {
 			if in.GetWordBeforeCursor() == "" {
 				return []prompt.Suggest{}
@@ -62,7 +77,9 @@ func main() {
 			return LivePrefixState.LivePrefix, LivePrefixState.IsEnable
 		}),
 		prompt.OptionTitle("Httpgo"),
-		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindQuit()),
+		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindQuit(), prompt.KeyBind{Key: prompt.F6, Fn: func(buf *prompt.Buffer) {
+			history()
+		}}),
 		prompt.OptionPrefixTextColor(prompt.Blue),
 	)
 	fmt.Println("Welcome to the Httpgo!\nEnter '?' for help, Ctrl+D exit")
@@ -70,170 +87,168 @@ func main() {
 	p.Run()
 }
 
-func executor(in string) {
-	in = strings.TrimSpace(in)
-	switch in {
-	case HELP:
-		usage()
-	case PRINT:
-		dump()
-	case HISTORY:
-		if histories == nil {
-			fmt.Println("No History!")
-			return
-		}
-		sel := promptui.Select{}
-		sel.Label = "History: "
-		items := []string{fmt.Sprintf("%s %s", histories.req.Method, histories.req.URL.String())}
-
-		for h := histories.next; h != nil; h = h.next {
-			items = append(items, fmt.Sprintf("%s %s", h.req.Method, h.req.URL.String()))
-		}
-
-		sel.Items = items
-		idx, _, err := sel.Run()
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		i := 0
-		fmt.Println(i, idx)
-		for h := histories.next; h != nil; h = h.next {
-			if i == idx {
-				req = &(h.req)
-				break
-			}
-			i++
-		}
-		changePrefix()
-	default:
-		var tokenizer Tokenizer
-		tokenizer.Init(in)
-		var tok Token
-	loop:
-		for {
-			tok = tokenizer.Next()
-			switch tok.Type {
-			case String:
-				// 脚本
-				if strings.HasPrefix(tok.Val, "!") {
-					content := readFile(tok.Val[1:])
-					if len(content) == 0 {
-						continue loop
+func parse(in string) {
+	var tokenizer Tokenizer
+	tokenizer.Init(in)
+	var tok Token
+loop:
+	for {
+		tok = tokenizer.Next()
+		switch tok.Type {
+		case String:
+			// 脚本
+			if strings.HasPrefix(tok.Val, "!") {
+				content := readFile(tok.Val[1:])
+				if len(content) == 0 {
+					continue loop
+				}
+				fmt.Printf("> Load file `%s`\n", tok.Val[1:])
+				rd := bufio.NewReader(bytes.NewReader(content))
+				var command []string
+				for {
+					l, err := rd.ReadString('\n')
+					if err == io.EOF {
+						break
 					}
-					fmt.Printf("> Load file `%s`\n", tok.Val[1:])
-					rd := bufio.NewReader(bytes.NewReader(content))
-					var command []string
-					for {
-						l, err := rd.ReadString('\n')
-						if err == io.EOF {
-							break
-						}
-						l = strings.TrimSpace(l)
-						if l != "" {
-							fmt.Println(">", l)
-							command = append(command, l)
-						}
+					l = strings.TrimSpace(l)
+					if l != "" {
+						fmt.Println(">", l)
+						command = append(command, l)
 					}
-					if len(command) > 0 {
-						tokenizer.Init(strings.Join(command, " "))
-						goto loop
-					}
-					// http method
-				} else if inSlice(HTTPMethods, tok.Val) {
-					req.Method = strings.ToUpper(tok.Val)
-					// json path
-				} else if strings.HasPrefix(tok.Val, "[") && strings.HasSuffix(tok.Val, "]") {
-					if len(req.ResponseBody) == 0 {
-						continue loop
-					}
-					jsonPath := tok.Val[1 : len(tok.Val)-1]
-					v := gjson.GetBytes(req.ResponseBody, jsonPath)
-					b, _ := json.MarshalIndent(v.Value(), "", " ")
-					fmt.Println("json:", jsonPath, string(b))
-					suggest.AddSuggest(tok.Val)
-				} else {
-					var _url *url.URL
-					var err error
-					if req.URL != nil && strings.HasPrefix(tok.Val, "/") {
-						_url, err = req.URL.Parse(tok.Val)
-						if err != nil {
-							req.errorf("parse `%s` %v\n", tok.Val, err)
-							return
-						}
-					} else if strings.HasPrefix(tok.Val, ":") || strings.HasPrefix(tok.Val, "/") {
-						_url, err = url.Parse(scheme + "://localhost" + tok.Val)
-					} else if !strings.HasPrefix(tok.Val, "http://") && !strings.HasPrefix(tok.Val, "https://") {
-						_url, err = url.Parse(scheme + "://" + tok.Val)
-					} else {
-						_url, err = url.Parse(tok.Val)
-						if err == nil {
-							scheme = _url.Scheme
-						}
-					}
-
+				}
+				if len(command) > 0 {
+					tokenizer.Init(strings.Join(command, " "))
+					goto loop
+				}
+				// http method
+			} else if inSlice(HTTPMethods, tok.Val) {
+				req.Method = strings.ToUpper(tok.Val)
+				// raw json
+			} else if strings.HasPrefix(tok.Val, "{") || strings.HasPrefix(tok.Val, "[") {
+				var j interface{}
+				err := json.UnmarshalFromString(tok.Val, &j)
+				if err != nil {
+					fmt.Println(err)
+					return
+				}
+				req.Body.Reset()
+				req.Body.WriteString(tok.Val)
+				if req.Method == GET {
+					req.Method = POST
+				}
+				// json path
+			} else if strings.HasPrefix(tok.Val, "#") {
+				if len(req.ResponseBody) == 0 {
+					continue loop
+				}
+				jsonPath := tok.Val[1:]
+				v := gjson.GetBytes(req.ResponseBody, jsonPath)
+				b, _ := json.MarshalIndent(v.Value(), "", " ")
+				fmt.Println("json:", jsonPath, string(b))
+				suggest.AddSuggest(tok.Val)
+				// url
+			} else {
+				var _url *url.URL
+				var err error
+				if req.URL != nil && strings.HasPrefix(tok.Val, "/") {
+					_url, err = req.URL.Parse(tok.Val)
 					if err != nil {
-						req.error(err)
+						req.errorf("parse `%s` %v\n", tok.Val, err)
 						return
 					}
-
-					if req.Method == "" {
-						req.Method = GET
-					}
-
-					suggest.AddSuggest(_url.String())
-					if req.URL != nil && _url.String() != req.URL.String() {
-						req.reset()
-					}
-					req.URL = _url
-				}
-			case Header:
-				req.Header.Set(tok.Key, tok.Val)
-				suggest.AddSuggest(tok.Key)
-				suggest.AddSuggest(tok.Key + ":" + tok.Val)
-			case Field:
-				req.Fields.Set(tok.Key, tok.Val)
-				suggest.AddSuggest(tok.Key)
-				suggest.AddSuggest(tok.Key + "=" + tok.Val)
-			case Param:
-				req.Values.Set(tok.Key, tok.Val)
-				suggest.AddSuggest(tok.Key)
-				suggest.AddSuggest(tok.Key + "==" + tok.Val)
-			case RawJSON:
-				rawJSON(tok.Key, tok.Val)
-				suggest.AddSuggest(tok.Key)
-				suggest.AddSuggest(tok.Key + "=:" + tok.Val)
-
-				if req.Method == GET {
-					req.Method = POST
-				}
-			case Flag:
-				flag(tok.Key, tok.Val)
-				suggest.AddSuggest(tok.Key)
-				suggest.AddSuggest(tok.Key + "=" + tok.Val)
-			case File:
-				if tok.Key == "" {
-					req.Body.Reset()
-					req.Body.Write(readFile(tok.Val))
-					suggest.AddSuggest("@" + tok.Val)
+				} else if strings.HasPrefix(tok.Val, ":") || strings.HasPrefix(tok.Val, "/") {
+					_url, err = url.Parse(scheme + "://localhost" + tok.Val)
+				} else if !strings.HasPrefix(tok.Val, "http://") && !strings.HasPrefix(tok.Val, "https://") {
+					_url, err = url.Parse(scheme + "://" + tok.Val)
 				} else {
-					req.Files.Add(tok.Key, tok.Val)
-					suggest.AddSuggest(tok.Key)
-					suggest.AddSuggest("@" + tok.Val)
+					_url, err = url.Parse(tok.Val)
+					if err == nil {
+						scheme = _url.Scheme
+					}
 				}
 
-				if req.Method == GET {
-					req.Method = POST
+				if err != nil {
+					req.error(err)
+					return
 				}
-			case EOF:
-				break loop
+
+				if req.Method == "" {
+					req.Method = GET
+				}
+
+				suggest.AddSuggest(_url.String())
+				if req.URL != nil && _url.String() != req.URL.String() {
+					req.reset()
+				}
+				req.URL = _url
 			}
-		}
+		case Header:
+			req.Header.Set(tok.Key, tok.Val)
+			suggest.AddSuggest(tok.Key)
+			suggest.AddSuggest(tok.Key + ":" + tok.Val)
+		case Field:
+			req.Fields.Set(tok.Key, tok.Val)
+			suggest.AddSuggest(tok.Key)
+			suggest.AddSuggest(tok.Key + "=" + tok.Val)
+		case Param:
+			req.Values.Set(tok.Key, tok.Val)
+			suggest.AddSuggest(tok.Key)
+			suggest.AddSuggest(tok.Key + "==" + tok.Val)
+		case RawJSON:
+			rawJSON(tok.Key, tok.Val)
+			suggest.AddSuggest(tok.Key)
+			suggest.AddSuggest(tok.Key + "=:" + tok.Val)
 
-		changePrefix()
+			if req.Method == GET {
+				req.Method = POST
+			}
+		case Flag:
+			flag(tok.Key, tok.Val)
+			suggest.AddSuggest(tok.Key)
+			suggest.AddSuggest(tok.Key + "=" + tok.Val)
+		case File:
+			if tok.Key == "" {
+				req.Body.Reset()
+				req.Body.Write(readFile(tok.Val))
+				suggest.AddSuggest("@" + tok.Val)
+			} else {
+				req.Files.Add(tok.Key, tok.Val)
+				suggest.AddSuggest(tok.Key)
+				suggest.AddSuggest("@" + tok.Val)
+			}
+
+			if req.Method == GET {
+				req.Method = POST
+			}
+		case EOF:
+			break loop
+		}
 	}
 
+	changePrefix()
+}
+
+func history() {
+	if histories == nil {
+		fmt.Println("No History!")
+		return
+	}
+	sel := promptui.Select{}
+	sel.Label = "History: "
+	items := []*History{histories}
+
+	for h := histories.next; h != nil; h = h.next {
+		items = append(items, h)
+	}
+
+	sel.Items = items
+	idx, _, err := sel.Run()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	req = &(items[idx].req)
+	changePrefix()
 }
 
 func changePrefix() {
