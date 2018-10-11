@@ -402,6 +402,9 @@ func httpCall() {
 	} else {
 		for ; t != nil; t = t.next {
 			if t.req.Method == hist.Method && t.req.URL.String() == hist.URL.String() {
+				if t.prev != nil {
+					t.prev.next = t.next
+				}
 				t.next, histories.prev, histories = histories, t, t
 				return
 			}
