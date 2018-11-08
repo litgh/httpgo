@@ -24,9 +24,8 @@ import (
 )
 
 const (
-	HELP    = "?"
-	PRINT   = "p"
-	HISTORY = "!!"
+	HELP  = "?"
+	PRINT = "p"
 )
 
 var (
@@ -393,24 +392,24 @@ func httpCall() {
 		return
 	}
 
-	t := histories.next
-	if t == nil {
-		if histories.req.Method == hist.Method && histories.req.URL.String() == hist.URL.String() {
-			histories.req = hist
-			return
-		}
-	} else {
-		for ; t != nil; t = t.next {
-			if t.req.Method == hist.Method && t.req.URL.String() == hist.URL.String() {
-				if t.prev != nil {
-					t.prev.next = t.next
-				}
-				t.next, histories.prev, histories = histories, t, t
-				return
-			}
-		}
-	}
-	t = &History{req: hist}
+	// t := histories.next
+	// if t == nil {
+	// 	if histories.req.Method == hist.Method && histories.req.URL.String() == hist.URL.String() {
+	// 		histories.req = hist
+	// 		return
+	// 	}
+	// } else {
+	// 	for ; t != nil; t = t.next {
+	// 		if t.req.Method == hist.Method && t.req.URL.String() == hist.URL.String() {
+	// 			if t.prev != nil {
+	// 				t.prev.next = t.next
+	// 			}
+	// 			t.next, histories.prev, histories = histories, t, t
+	// 			return
+	// 		}
+	// 	}
+	// }
+	t := &History{req: hist}
 	t.next, histories.prev, histories = histories, t, t
 
 }
