@@ -8,7 +8,7 @@ import (
 
 const (
 	String = iota
-	Flag
+	Variable
 	Header
 	Field
 	Param
@@ -52,7 +52,7 @@ func (t *Tokenizer) Next() Token {
 		case '$':
 			t.tokBuf.WriteRune(ch)
 			t.scanNext('=')
-			return Token{Type: Flag, Key: t.Token(), Val: t.scanNext(' ')}
+			return Token{Type: Variable, Key: t.Token(), Val: t.scanNext(' ')}
 		case ':':
 			s := t.tokBuf.String()
 			if s == "http" || s == "https" || s == "" || strings.Contains(s, ".") {

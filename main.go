@@ -17,8 +17,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/c-bata/go-prompt"
-	"github.com/json-iterator/go"
+	prompt "github.com/c-bata/go-prompt"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/manifoldco/promptui"
 	"github.com/tidwall/gjson"
 )
@@ -33,19 +33,10 @@ var (
 	req       = newReq()
 	scheme    = "http"
 	suggest   = newSuggestion()
-	histories *History
+	histories = make(History)
 )
 
-type History struct {
-	idx  int
-	prev *History
-	next *History
-	req  Request
-}
-
-func (h *History) String() string {
-	return fmt.Sprintf("%s %s", h.req.Method, h.req.URL.String())
-}
+type History map[string]map[string]Request
 
 var LivePrefixState struct {
 	LivePrefix string
@@ -53,16 +44,19 @@ var LivePrefixState struct {
 }
 
 func main() {
-	p := prompt.New(
+	fmt.Println("Welcome to the Httpgo!\nEnter '?' for help, Ctrl+D exit")
+	printUsage()
+	loadInitEnv()
+	prompt.New(
 		func(in string) {
 			in = strings.TrimSpace(in)
 			switch in {
 			case HELP:
-				usage()
+				printUsage()
 			case PRINT:
-				dump()
+				req.dumpRequest()
 			default:
-				parse(in)
+				parseInput(in)
 			}
 
 		},
@@ -76,20 +70,26 @@ func main() {
 			return LivePrefixState.LivePrefix, LivePrefixState.IsEnable
 		}),
 		prompt.OptionTitle("Httpgo"),
-		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindQuit(), prompt.KeyBind{Key: prompt.F6, Fn: func(buf *prompt.Buffer) {
+		prompt.OptionAddKeyBind(bindReset(), bindDoRequest(), bindSave(), prompt.KeyBind{Key: prompt.F6, Fn: func(buf *prompt.Buffer) {
 			history()
 		}}),
 		prompt.OptionPrefixTextColor(prompt.Blue),
-	)
-	fmt.Println("Welcome to the Httpgo!\nEnter '?' for help, Ctrl+D exit")
-	usage()
-	p.Run()
+	).Run()
 }
 
-func parse(in string) {
+func loadInitEnv() {
+	_, err := os.Stat("./env")
+	if err == nil || os.IsExist(err) {
+		parseInput("!env")
+	}
+
+}
+
+func parseInput(in string) {
 	var tokenizer Tokenizer
 	tokenizer.Init(in)
 	var tok Token
+	var setMethod bool
 loop:
 	for {
 		tok = tokenizer.Next()
@@ -122,6 +122,7 @@ loop:
 				// http method
 			} else if inSlice(HTTPMethods, tok.Val) {
 				req.Method = strings.ToUpper(tok.Val)
+				setMethod = true
 				// raw json
 			} else if strings.HasPrefix(tok.Val, "{") || strings.HasPrefix(tok.Val, "[") {
 				var j interface{}
@@ -176,6 +177,7 @@ loop:
 				}
 
 				suggest.AddSuggest(_url.String())
+				suggest.AddSuggest(_url.RequestURI())
 				if req.URL != nil && _url.String() != req.URL.String() {
 					req.reset()
 				}
@@ -201,8 +203,8 @@ loop:
 			if req.Method == GET {
 				req.Method = POST
 			}
-		case Flag:
-			flag(tok.Key, tok.Val)
+		case Variable:
+			variable(tok.Key, tok.Val)
 			suggest.AddSuggest(tok.Key)
 			suggest.AddSuggest(tok.Key + "=" + tok.Val)
 		case File:
@@ -224,30 +226,54 @@ loop:
 		}
 	}
 
+	if req.URL == nil {
+		changePrefix()
+		return
+	}
+	if m, ok := histories[req.URL.String()]; ok {
+		l := len(m)
+		if !setMethod && l > 1 {
+			items := make([]Request, l, l)
+			i := 0
+			for _, r := range m {
+				items[i] = r
+			}
+			histSelect(items)
+		} else if !setMethod && l == 1 {
+			for _, r := range m {
+				*req = r
+			}
+		}
+	}
 	changePrefix()
 }
 
 func history() {
-	if histories == nil {
+	if len(histories) == 0 {
 		fmt.Println("No History!")
 		return
 	}
-	sel := promptui.Select{}
-	sel.Label = "History: "
-	items := []*History{histories}
+	items := []Request{}
 
-	for h := histories.next; h != nil; h = h.next {
-		items = append(items, h)
+	for _, h := range histories {
+		for _, r := range h {
+			items = append(items, r)
+		}
 	}
 
+	histSelect(items)
+}
+
+func histSelect(items []Request) {
+	sel := promptui.Select{}
+	sel.Label = "History: "
 	sel.Items = items
 	idx, _, err := sel.Run()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	req = &(items[idx].req)
-	changePrefix()
+	req = &(items[idx])
 }
 
 func changePrefix() {
@@ -259,23 +285,12 @@ func changePrefix() {
 	}
 }
 
-func usage() {
+func printUsage() {
 	fmt.Println(`
   p print current request info
   Ctrl + c reset current state
   Ctrl + r do request
 	`)
-}
-
-func dump() {
-	httpReq, err := req.newHTTPRequest()
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	dump, _ := httputil.DumpRequestOut(httpReq, true)
-	fmt.Println(colorize(dump))
-	fmt.Println("")
 }
 
 func inSlice(slice []string, value string) bool {
@@ -287,7 +302,7 @@ func inSlice(slice []string, value string) bool {
 	return false
 }
 
-func bindQuit() prompt.KeyBind {
+func bindSave() prompt.KeyBind {
 	return prompt.KeyBind{Key: prompt.ControlB, Fn: func(buf *prompt.Buffer) {
 		suggest.Save()
 	}}
@@ -386,32 +401,8 @@ func httpCall() {
 	fmt.Printf("\n%s\n", colorize(out))
 	req.ResponseBody, _ = ioutil.ReadAll(resp.Body)
 
-	hist := *req
-	if histories == nil {
-		histories = &History{req: hist}
-		return
-	}
-
-	// t := histories.next
-	// if t == nil {
-	// 	if histories.req.Method == hist.Method && histories.req.URL.String() == hist.URL.String() {
-	// 		histories.req = hist
-	// 		return
-	// 	}
-	// } else {
-	// 	for ; t != nil; t = t.next {
-	// 		if t.req.Method == hist.Method && t.req.URL.String() == hist.URL.String() {
-	// 			if t.prev != nil {
-	// 				t.prev.next = t.next
-	// 			}
-	// 			t.next, histories.prev, histories = histories, t, t
-	// 			return
-	// 		}
-	// 	}
-	// }
-	t := &History{req: hist}
-	t.next, histories.prev, histories = histories, t, t
-
+	histories[req.URL.String()] = make(map[string]Request)
+	histories[req.URL.String()][req.Method] = *req
 }
 
 func rawJSON(key, value string) {
@@ -450,7 +441,7 @@ func readFile(filename string) []byte {
 	return content
 }
 
-func flag(key, value string) {
+func variable(key, value string) {
 	switch key {
 	case "$auth":
 		pair := strings.Split(value, ":")

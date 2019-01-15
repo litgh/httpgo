@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
@@ -56,6 +57,10 @@ type Request struct {
 	JSONMap         map[string][]interface{}
 	Body            bytes.Buffer
 	ResponseBody    []byte
+}
+
+func (r Request) String() string {
+	return r.Method + " " + r.URL.String()
 }
 
 func newReq() *Request {
@@ -208,4 +213,15 @@ func colorize(dump []byte) string {
 		return buf.Bytes()
 	})
 	return string(b)
+}
+
+func (r *Request) dumpRequest() {
+	httpReq, err := r.newHTTPRequest()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	dump, _ := httputil.DumpRequestOut(httpReq, true)
+	fmt.Println(colorize(dump))
+	fmt.Println("")
 }
